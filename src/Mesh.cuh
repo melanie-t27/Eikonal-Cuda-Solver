@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <chrono>
+#include <optional>
 #include "../src/CudaEikonalTraits.cuh"
 #define IDXTYPEWIDTH 32
 #define REALTYPEWIDTH 64
@@ -45,72 +46,16 @@ public:
         // we read the mesh from file and store the tetrahedra in sets, each set element represents a tetrahedron
         auto start1 = std::chrono::high_resolution_clock::now();
         std::set<std::set<int>> sets = Mesh<D, Float>::init_mesh(mesh_file_path, 4);
-        
-        tetra.resize(sets.size() * (D+1));
-        int i = 0;
-        for(auto &t : sets) {
-            int j = 0;
-            for(auto &v : t) {
-                tetra[i+j] = v;
-                j++;
-            }
-            i += D+1;
-        }
-
         // we read the matrices from file and store them in a vector of matrices
         std::vector<Matrix> tempM = readMatrices(matrix_file_path);
-        // perform the partition with Metis providing the vector of matrices
-        execute_metis_api(tempM);
-
-        std::vector<std::vector<int>> g;
-        g.resize(getNumberVertices());
-        for(i = 0; i < tetra.size(); i += D+1) {
-            for(int j = 0; j < D + 1; j++) {
-                g[tetra[j+i]].push_back(i/(D+1));
-            }
-        }
-
-        //check
-        int max = 0;
-        for(int i = 0; i < g.size(); i++) {
-            if(g[i].size() > max) {
-                max = g[i].size();
-            }
-        }
-        max_neighbour_tetra = max;
-
-        ngh.resize(getNumberVertices());
-        ngh[0] = 0;
-        unsigned int cont = 0;
-        for(i = 1; i < ngh.size(); i++) {
-            ngh[i] = ngh[i-1] + g[i - 1].size();
-            cont += g[i-1].size();
-        }
-        cont += g[ngh.size()-1].size();
-        shapes.resize(cont);
-        cont = 0;
-
-        for(i = 0; i < g.size(); i++) {
-            for(int j = 0; j < g[i].size(); j++) {
-                shapes[cont].tetra_index = g[i][j];
-                int tetra_to_search = g[i][j];
-                for(int k = 0; k < 4; k++) {
-                    if(tetra[4 * tetra_to_search + k] == i) {
-                        shapes[cont].tetra_config = k + 1;
-                    }
-                }
-                cont++;
-            }
-        }
+        construct_mesh(nparts, mesh_file_path, tempM, sets);
         auto stop1 = std::chrono::high_resolution_clock::now();
         std::cout << "Mesh Constr time (microseconds) = " <<
                   std::chrono::duration_cast<std::chrono::microseconds>(stop1 - start1).count() << std::endl;
     }
 
-    Mesh(const std::string& mesh_file_path, int nparts, const Matrix& velocity) : partitions_number(nparts){
-        auto start1 = std::chrono::high_resolution_clock::now(); 
-        // sets contains the tetrahedra. Each set element represents a tetrahedron
-        std::set<std::set<int>> sets = Mesh<D, Float>::init_mesh(mesh_file_path, 4);
+    void construct_mesh(int nparts, const std::string& mesh_file_path, const std::vector<Matrix>& tempM, const std::set<std::set<int>>& sets) {
+        
         // tetra is filled with the indices of the vertices that form the tetrahedron
         tetra.resize(sets.size() * (D+1));
         unsigned int i = 0;
@@ -123,14 +68,7 @@ public:
             i += D+1;
         }
 
-        std::vector<Matrix> tempM;
-        // we have a matrix associated to each tetrahedron
-        tempM.resize(tetra.size()/(D+1));
 
-        for(i = 0; i < tetra.size() / (D + 1); i++){
-            // We initialize each matrix using the one provided as a constructor parameter.
-            tempM[i] = velocity;
-        }
         // we perform the partitioning providing the vector of matrices to the method
         execute_metis_api(tempM);
 
@@ -173,6 +111,23 @@ public:
                 cont++;
             }
         }
+        construct_partitions_boundaries();
+    }
+
+    Mesh(const std::string& mesh_file_path, int nparts, const Matrix& velocity) : partitions_number(nparts){
+        auto start1 = std::chrono::high_resolution_clock::now(); 
+        std::set<std::set<int>> sets = Mesh<D, Float>::init_mesh(mesh_file_path, 4);
+        std::vector<Matrix> tempM;
+        // we have a matrix associated to each tetrahedron
+        tempM.resize(sets.size());
+
+        for(int i = 0; i < sets.size(); i++){
+            // We initialize each matrix using the one provided as a constructor parameter.
+            tempM[i] = velocity;
+        }
+        
+        construct_mesh(nparts, mesh_file_path, tempM, sets);
+
         auto stop1 = std::chrono::high_resolution_clock::now();
         std::cout << "Mesh Constr time (microseconds) = " <<
                   std::chrono::duration_cast<std::chrono::microseconds>(stop1 - start1).count() << std::endl;
@@ -202,7 +157,7 @@ public:
             }
             auto stop1 = std::chrono::high_resolution_clock::now();
             std::cout << "Metis time (microseconds)= " <<
-                  std::chrono::duration_cast<std::chrono::microseconds>(stop1 - start1).count() << std::endl;
+            std::chrono::duration_cast<std::chrono::microseconds>(stop1 - start1).count() << std::endl;
             reorderPartitions(parts_vertices);
             reorderTetra(parts_tetra, tempM);
 
@@ -210,10 +165,10 @@ public:
 
         } else {
             std::cout << "Metis time = 0" << std::endl;
-            std::vector<int> parts(getNumberVertices(), 0);
-            reorderPartitions(parts);
-            parts = std::vector<int>(getNumberTetra(), 0);
-            reorderTetra(parts, tempM);
+            std::vector<int> pos;
+            pos.resize(tetra.size()/(D+1));
+            std::iota(pos.begin(), pos.end(),0);
+            init_M_matrix(tempM, pos);
         }
     }
 
@@ -376,7 +331,7 @@ public:
         return parts;
     }
 
-    void getSolutionsVTK(const std::string& output_file_name, Float* solutions){
+    void getSolutionsVTK(const std::string& output_file_name, std::vector<Float> solutions){
         std::ofstream output_file(output_file_name);
         if(!output_file.is_open()) {
             std::cout << "output file not opened " << output_file_name << std::endl;
@@ -440,6 +395,10 @@ public:
     const std::vector<int>& get_ngh() const {
         return ngh;
     }
+    
+    const std::vector<int>& getPartitionsBoundaries() {
+        return partitions_boundaries;
+    }
 
     /*const std::vector<int>& get_partitions() const {
         return partitions_vertices;
@@ -458,8 +417,31 @@ protected:
         return res;
     }
 
+    void init_M_matrix(const std::vector<Matrix>& tempM, const std::vector<int>& pos) {
+        M.resize(6*pos.size());
+        for(int i = 0; i < pos.size(); i++) {
+            VectorExt x1 = getCoordinates<VectorExt>(tetra[4*pos[i]]);
+            VectorExt x2 = getCoordinates<VectorExt>(tetra[4*pos[i]+1]);
+            VectorExt x3 = getCoordinates<VectorExt>(tetra[4*pos[i]+2]);
+            VectorExt x4 = getCoordinates<VectorExt>(tetra[4*pos[i]+3]);
+            VectorExt e12 = x2+(-x1);
+            VectorExt e13 = x3+(-x1);
+            VectorExt e23 = x3+(-x2);
+            VectorExt e14 = x4+(-x1);
+            VectorExt e24 = x4+(-x2);
+            VectorExt e34 = x4+(-x3);
+            M[i * 6]     = 
+            e12.transpose() * (tempM[pos[i]] * e12);
+            M[i * 6 + 1] = e13.transpose() * (tempM[pos[i]] * e13);
+            M[i * 6 + 2] = e23.transpose() * (tempM[pos[i]] * e23);
+            M[i * 6 + 3] = e14.transpose() * (tempM[pos[i]] * e14);
+            M[i * 6 + 4] = e24.transpose() * (tempM[pos[i]] * e24);
+            M[i * 6 + 5] = e34.transpose() * (tempM[pos[i]] * e34);
+        }
+    }
+
     // we reorder the tetrahedra according to the partition they belong to
-    void reorderTetra(std::vector<int> partitions_vector, std::vector<Matrix> tempM){
+    void reorderTetra(const std::vector<int>& partitions_vector, const std::vector<Matrix>& tempM){
         std::vector<int> pos;
         pos.resize(partitions_vector.size());
         std::iota(pos.begin(), pos.end(),0);
@@ -472,25 +454,19 @@ protected:
             for(int j=0; j<D+1; j++){
                 reordered_tetra[4*i+j] = tetra[4*pos[i]+j];
             }
-            VectorExt x1 = getCoordinates<VectorExt>(tetra[4*pos[i]]);
-            VectorExt x2 = getCoordinates<VectorExt>(tetra[4*pos[i]+1]);
-            VectorExt x3 = getCoordinates<VectorExt>(tetra[4*pos[i]+2]);
-            VectorExt x4 = getCoordinates<VectorExt>(tetra[4*pos[i]+3]);
-            VectorExt e12 = x2+(-x1);
-            VectorExt e13 = x3+(-x1);
-            VectorExt e23 = x3+(-x2);
-            VectorExt e14 = x4+(-x1);
-            VectorExt e24 = x4+(-x2);
-            VectorExt e34 = x4+(-x3);
-            M[i * 6]     = e12.transpose() * (tempM[pos[i]] * e12);
-            M[i * 6 + 1] = e13.transpose() * (tempM[pos[i]] * e13);
-            M[i * 6 + 2] = e23.transpose() * (tempM[pos[i]] * e23);
-            M[i * 6 + 3] = e14.transpose() * (tempM[pos[i]] * e14);
-            M[i * 6 + 4] = e24.transpose() * (tempM[pos[i]] * e24);
-            M[i * 6 + 5] = e34.transpose() * (tempM[pos[i]] * e34);
         }
+
+        init_M_matrix(tempM, pos);
+
         tetra = reordered_tetra;
     }
+
+
+
+
+
+
+
 
     // we provide to the method a vector of integers where each entry represents the partition assignment of a vertex.
     // For example, if partitions_vector[i] = 2, then the i-th vertex belongs to partition 2.
@@ -682,6 +658,35 @@ protected:
         return sets;
     }
 
+    int getDomain(int vertex_index) {
+        for(int i = 0; i < this->getPartitionsNumber(); i++) {
+            if(vertex_index < this->getPartitionVertices()[i]) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+
+    void construct_partitions_boundaries() {
+        partitions_boundaries.resize(getNumberVertices(), -1);
+        for(int i = 0; i < tetra.size();i+=D+1) {
+            for(int j = 0; j < D+1;j++) {
+                for(int k = 0; k < D+1; k++) {
+                    if(j != k) {
+                        if(partitions_boundaries[tetra[i+j]] == -1) {
+                            int domain_j = getDomain(tetra[i+j]);
+                            int domain_k = getDomain(tetra[i+k]);
+                            if(domain_j != domain_k) {
+                                partitions_boundaries[tetra[i+j]] = domain_k;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 
     // vector storing the coordinates of the vertices. It stores the x,y and z values for the first vertex,
     // followed by the x,y and z values and so on.
@@ -714,6 +719,8 @@ protected:
 
     // vector defining the boundaries of each partition in tetra (i.e. defines the set of tetrahedra in each partition)
     std::vector<int> partitions_tetrahedra;
+
+    std::vector<int> partitions_boundaries;
 
 };
 

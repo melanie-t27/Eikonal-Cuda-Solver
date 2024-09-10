@@ -195,15 +195,13 @@ __global__ void constructPredicate(TetraConfig* elemList, size_t* elemListSize, 
         if(pred == 1) {
             for(int j = 0; j < D + 1; j++) {
                 // for each node in tetra except for the node
-                if(j != tetra.tetra_config - 1) {
-                    if(solutions_dev[tetra_dev[(D+1) * tetra.tetra_index + j]] - shared_sol > tol) {
-                        predicate[tetra_dev[(D+1) * tetra.tetra_index + j]] = 1;
-                    }
+                if(j != tetra.tetra_config - 1 && solutions_dev[tetra_dev[(D+1) * tetra.tetra_index + j]] - shared_sol > 0 * tol) {
+                    predicate[tetra_dev[(D+1) * tetra.tetra_index + j]] = 1;
                 }
             }
             // we set to 2 converged nodes: active_list[node]=2
             if(threadIdx.x == 0) {
-                active_list_dev[tetra_dev[(D+1) * tetra.tetra_index + tetra.tetra_config - 1] - domain_begin] = 2;
+                active_list_dev[tetra_dev[(D+1) * tetra.tetra_index + tetra.tetra_config - 1] - domain_begin] = 0;
             }
         }
 
@@ -213,6 +211,77 @@ __global__ void constructPredicate(TetraConfig* elemList, size_t* elemListSize, 
         }
     }
 }
+
+
+
+/*template <int D, typename Float>
+__global__ void constructPredicate_v2(TetraConfig* elemList, size_t* elemListSize, int active_nodes, int* sAddr, int* tetra_dev, Float* geo_dev, Float* solutions_dev, int* predicate, Float* M_dev, Float tol, int* active_list_dev, int domain_begin, int domain_size) {
+    using VectorExt = typename CudaEikonalTraits<Float, D>::VectorExt;
+    using VectorV = typename CudaEikonalTraits<Float, D>::VectorV;
+    using Matrix = typename CudaEikonalTraits<Float, D>::Matrix;
+
+    int sAddr_index = blockIdx.x;
+    int elemList_index = sAddr[sAddr_index] + threadIdx.x;
+    int upper_bound = ((sAddr_index != active_nodes - 1) ? sAddr[sAddr_index + 1] : (int)*elemListSize);
+    __shared__ Float shared_sol;
+    Float old_sol[4];
+    VectorExt coordinates[4];
+    VectorV values;
+    TetraConfig tetra[4];
+    for(int i = elemList_index, cont = 0; i < upper_bound; i += blockDim.x, cont++) {
+        // compute tetra index
+        tetra[cont] = elemList[i];
+        // old_sol = solusions_dev[node], where node is index of the node associated with tetra.config
+        old_sol[cont] = solutions_dev[tetra_dev[(D+1) * tetra[cont].tetra_index + tetra[cont].tetra_config - 1]];
+        if(threadIdx.x == 0 && cont == 0) {
+            shared_sol = old_sol[cont];
+        }
+    }
+    
+    __syncthreads();
+    for(int i = elemList_index, cont = 0; i < upper_bound; i += blockDim.x, cont++) {
+        for(int j = 0; j < D + 1; j++){
+            for(int k = 0; k < D; k++) {
+                coordinates[j][k] =  geo_dev[D * tetra_dev[(D+1) * tetra[cont].tetra_index + j] + k];
+            }
+            // retrieve solutions of all nodes in tetra
+            values[j] = solutions_dev[tetra_dev[(D+1) * tetra[cont].tetra_index + j]];
+        }
+        // retrieve velocity matrix associated to tetra
+        const Float* M;
+        M = M_dev + tetra[cont].tetra_index * 6;
+        // we call the solve method of the LocalSolver
+        Float sol = LocalSolver<D, Float>::solve(coordinates, values, M, D+1-tetra[cont].tetra_config);
+        // shared_sol <- min(shared_sol, sol)
+        atomicSwapIfLess<Float>(&shared_sol, sol);
+    }
+    __syncthreads();
+
+    for(int i = elemList_index, cont = 0; i < upper_bound; i += blockDim.x, cont++) {
+        int pred = std::abs(old_sol[cont] - shared_sol) < tol * (1 + 0.5 * (shared_sol + old_sol[cont]));
+        if(pred == 1) {
+            for(int j = 0; j < D + 1; j++) {
+                // for each node in tetra except for the node
+                if(j != tetra[cont].tetra_config - 1 && solutions_dev[tetra_dev[(D+1) * tetra[cont].tetra_index + j]] - shared_sol > 50 * tol) {
+                    predicate[tetra_dev[(D+1) * tetra[cont].tetra_index + j]] = 1;
+                }
+            }
+            // we set to 2 converged nodes: active_list[node]=2
+            if(threadIdx.x == 0 && cont == 0) {
+                active_list_dev[tetra_dev[(D+1) * tetra[cont].tetra_index + tetra[cont].tetra_config - 1] - domain_begin] = 2;
+            }
+        }
+
+        // solution [node] = min(solution[node],shared sol)
+        if(threadIdx.x == 0 && cont == 0) {
+            atomicSwapIfLess<Float>(&solutions_dev[tetra_dev[tetra[cont].tetra_index * (D+1) + tetra[cont].tetra_config - 1]], shared_sol);
+        }
+    }
+}
+    */
+
+
+
 
 
 //requires length(active_list) == predicate_size
@@ -289,14 +358,48 @@ __global__ void processNodes(TetraConfig* elemList, size_t* elemListSize, int ac
 }
 
 // method to propagate activation of nodes across domains
-__global__ void propagatePredicate(int* active_list_dev, int domain_size, int begin_domain, int* predicate) {
+__global__ void propagatePredicate(int* active_list_dev, size_t domain_size, size_t begin_domain, int* predicate) {
     unsigned int tid = threadIdx.x + blockIdx.x * blockDim.x;
     if(tid < domain_size) {
-            if(predicate[begin_domain + tid] == 1) {
-                active_list_dev[tid] = 1;
-            }
+        if(predicate[begin_domain + tid] == 1) {
+            active_list_dev[tid] = 1;
+        }
         predicate[begin_domain + tid] = 0;
     }
 }
 
+
+
+template< typename Float>
+__global__ void propagateSolution(int* active_list_dev, int domain, int domain_size, int begin_domain, int vertices_number, int* partitions_boundaries, Float* solution) {
+    unsigned int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if(tid < domain_size) {
+        if(partitions_boundaries[begin_domain + tid] != -1 && partitions_boundaries[begin_domain + tid] != domain) {
+            Float other_solution = solution[partitions_boundaries[begin_domain + tid] * vertices_number + begin_domain + tid];
+            Float my_solution = solution[domain*vertices_number + begin_domain + tid];
+            if(other_solution > my_solution) {
+                solution[partitions_boundaries[begin_domain + tid] * vertices_number + begin_domain + tid] = my_solution;
+                active_list_dev[partitions_boundaries[begin_domain + tid] * vertices_number + begin_domain + tid] = 1;
+            } 
+        }
+    }
+}
+/*
+template< typename Float>
+__global__ void propagateSolution(int* active_list_dev, int num_domains, int domain, int domain_size, int begin_domain, int vertices_number, int* partitions_boundaries, Float* solution, Float infinity_value) {
+    unsigned int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if(tid < domain_size) {
+        Float min_sol = infinity_value;
+        for(int i = 0; i < num_domains; i++) {
+            Float tmp = solution[i*vertices_number + begin_domain + tid];
+            if(tmp < min_sol) {
+                min_sol = tmp;
+            }
+        }
+        for(int i = 0; i < num_domains; i++) {
+            solution[i*vertices_number + begin_domain + tid] = min_sol;
+        }
+    }
+}
+    */
 #endif
